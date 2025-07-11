@@ -112,9 +112,9 @@ def isic_dataset_agmentation(input_path, output_path, type, image_size = 256):
     '''
     # 读取数据
     if type == 'train':
-        data_path, gt_path = os.path.join(input_path, "ISBI2016_ISIC_Part1_Training_Data"), os.path.join(input_path, "ISBI2016_ISIC_Part1_Training_GroundTruth")
+        data_path, gt_path = os.path.join(input_path, "ISBI2016_ISIC_Part1_Train_Data"), os.path.join(input_path, "ISBI2016_ISIC_Part1_Train_GroundTruth")
     elif type == 'test':
-        data_path, gt_path = os.path.join(input_path, "ISBI2016_ISIC_Part1_Test_Data"), os.path.join(input_path, "ISBI2016_ISIC_Part1_Test_GroundTruth")
+        data_path, gt_path = os.path.join(input_path, "ISBI2016_ISIC_Part1_Val_Data"), os.path.join(input_path, "ISBI2016_ISIC_Part1_Val_GroundTruth")
     images_list = list(Path(data_path).glob('*.jpg')) # list(images_path.glob('*.png')) # 并非顺序
     images_list_str = [ str(x) for x in images_list ]
     images = images_list_str
@@ -173,12 +173,11 @@ class ISIC_ori_test_Dataset(Dataset):
         return (img, mask, id)
     
 
-
-# if __name__ == '__main__':
-#     i_path = "E:\DATA\ISIC2016" # ISIC2016原始数据集根目录
-#     o_path = "E:\DATA\ISIC2016\ISIC_augmentation" # 增强数据集预备存储的根目录
-#     isic_dataset_agmentation(i_path, o_path, "train")
-#     isic_dataset_agmentation(i_path, o_path, "test")
+if __name__ == '__main__':
+     i_path = "E:\dataset\VOCdevkit_All\ISIC_All\Val" # ISIC2016原始数据集根目录
+     o_path = "E:\dataset\VOCdevkit_All\SIC_All_augmentation" # 增强数据集预备存储的根目录
+     isic_dataset_agmentation(i_path, o_path, "train")
+     isic_dataset_agmentation(i_path, o_path, "test")
     
 # 测试数据集
 # if __name__ == '__main__':
