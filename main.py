@@ -8,11 +8,12 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from dataset import ISIC_aug_dataset
 # from torchmetrics import Dice
-from torch.utils.tensorboard import SummaryWriter
 from tqdm.notebook import tqdm
 import pickle
 import torch.nn.functional as f
 from monai.losses import DiceLoss
+from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
 #%%
 from improved_diffusion.ss_unet import UNetModel_WithSSF
 from improved_diffusion.script_util import create_gaussian_diffusion
@@ -22,6 +23,7 @@ from gan import NLayerDiscriminator
 image_size = 256
 batch_size = 8
 epochs = 100
+# DEVICE will be updated after Accelerator initialization
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 path = "E:\dataset\ISIC_augmentation"
 save_path = "./final_result"
@@ -83,10 +85,23 @@ def ls_gan_loss(dis, pred, target, timesteps, mode:str):
     else:
         return 0
 #%%
-Diff_UNet = UNetModel_WithSSF(model_channels=model_channnels, in_channels=in_channels, out_channels=out_channels, channel_mult=channel_mult, num_res_blocks=num_res_blocks, attention_resolutions=attn_resolutions, dropout = dropout, dims=dims, num_classes=num_classes, num_heads=num_heads, num_heads_upsample=num_heads_upsample, use_checkpoint=use_checkpoint, use_scale_shift_norm=use_scale_shift_norm);
-Diff_UNet.load_resunet(if_pre=False, in_channels=3);
-Diff_UNet.to(DEVICE);
-discriminator = NLayerDiscriminator(input_nc=1).to(DEVICE);
+Diff_UNet = UNetModel_WithSSF(
+    model_channels=model_channnels,
+    in_channels=in_channels,
+    out_channels=out_channels,
+    channel_mult=channel_mult,
+    num_res_blocks=num_res_blocks,
+    attention_resolutions=attn_resolutions,
+    dropout=dropout,
+    dims=dims,
+    num_classes=num_classes,
+    num_heads=num_heads,
+    num_heads_upsample=num_heads_upsample,
+    use_checkpoint=use_checkpoint,
+    use_scale_shift_norm=use_scale_shift_norm,
+)
+Diff_UNet.load_resunet(if_pre=False, in_channels=3)
+discriminator = NLayerDiscriminator(input_nc=1)
 #%%
 resume = False
 if resume:
@@ -98,7 +113,10 @@ if resume:
 diffusion = create_gaussian_diffusion(steps=1000, learn_sigma=False, predict_xstart=False)
 sampler = UniformSampler(diffusion)
 
-writer=SummaryWriter()
+ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+accelerator = Accelerator(log_with="wandb", kwargs_handlers=[ddp_kwargs])
+accelerator.init_trackers("cadiiff")
+DEVICE = accelerator.device
 #%%
 isic_train = ISIC_aug_dataset(path = path, type = 'Train', image_size=256)
 # isic_test = ISIC_aug_dataset(path = path, type = 'test', image_size=256)
@@ -106,13 +124,26 @@ isic_train = ISIC_aug_dataset(path = path, type = 'Train', image_size=256)
 train_loader = DataLoader(isic_train, batch_size=8, shuffle=True)
 # test_loader = DataLoader(isic_test, batch_size=1, shuffle=False)
 #%%
-opt_seg = torch.optim.AdamW(Diff_UNet.parameters(), lr = 1e-4, betas=(0.5,0.999))
-opt_d = torch.optim.AdamW(discriminator.parameters(), lr = 1e-4, betas=(0.,0.999))
-lr_schedular_seg=torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt_seg, T_0=7, T_mult=2)
+opt_seg = torch.optim.AdamW(Diff_UNet.parameters(), lr=1e-4, betas=(0.5, 0.999))
+opt_d = torch.optim.AdamW(discriminator.parameters(), lr=1e-4, betas=(0., 0.999))
+lr_schedular_seg = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt_seg, T_0=7, T_mult=2)
 # lr_schedular_d=torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt_d, T_0=7, T_mult=2)
-history={'loss_diff':[], 'loss_D':[], 'loss_G':[], 'loss_dice':[], 'loss_mse':[]}
+history = {'loss_diff': [], 'loss_D': [], 'loss_G': [], 'loss_dice': [], 'loss_mse': []}
 
-lossfunc1 = nn.MSELoss().to(DEVICE)
+lossfunc1 = nn.MSELoss()
+
+Diff_UNet, discriminator, opt_seg, opt_d, train_loader = accelerator.prepare(
+    Diff_UNet, discriminator, opt_seg, opt_d, train_loader
+)
+
+# Freeze parameters not present in optimizer to avoid errors with Accelerate
+opt_params = {p for group in opt_seg.param_groups for p in group["params"]}
+unused = [n for n, p in Diff_UNet.named_parameters() if p.requires_grad and p not in opt_params]
+if unused:
+    for name, p in Diff_UNet.named_parameters():
+        if name in unused:
+            p.requires_grad_(False)
+    accelerator.print(f"Frozen unused parameters: {unused}")
 #%%
 # initial for train
 trainstep=(len(train_loader.dataset)//batch_size)+1 
@@ -164,27 +195,29 @@ for epoch in outtertqdm:
         gan_loss = ls_gan_loss(discriminator, pred_xstart, real_mask, t, mode[1 if mode_num % num_train_D else 0])
 
         if gan_loss > 0:
-            if mode_num % num_train_D :
+            if mode_num % num_train_D:
                 totalLoss_gan_D += gan_loss
-                writer.add_scalar('loss_D',float(gan_loss.cpu().detach().numpy()))
+                accelerator.log({'loss_D': float(gan_loss.cpu().detach().numpy())}, step=epoch * trainstep + step)
                 step_D += 1
             else:
                 totalLoss_gan_G += gan_loss
-                writer.add_scalar('loss_G',float(gan_loss.cpu().detach().numpy()))
+                accelerator.log({'loss_G': float(gan_loss.cpu().detach().numpy())}, step=epoch * trainstep + step)
                 step_G += 1
 
         # update
-        total_loss = loss + loss_dice + gan_loss*loss_adv_weight + loss_mse
-        total_loss.backward()
+        total_loss = loss + loss_dice + gan_loss * loss_adv_weight + loss_mse
+        accelerator.backward(total_loss)
         
         opt_seg.step()
         if mode[1 if mode_num % num_train_D else 0] == 'train_D':
             opt_d.step()
             
         innertqdm.set_postfix({'step': step + 1, 'loss': loss.cpu().detach().numpy().item()})
-        writer.add_scalar('loss_diff',float(loss.cpu().detach().numpy()))
-        writer.add_scalar('loss_dice',float(loss_dice.cpu().detach().numpy()))
-        writer.add_scalar('loss_mse',float(loss_mse.cpu().detach().numpy()))
+        accelerator.log({
+            'loss_diff': float(loss.cpu().detach().numpy()),
+            'loss_dice': float(loss_dice.cpu().detach().numpy()),
+            'loss_mse': float(loss_mse.cpu().detach().numpy())
+        }, step=epoch * trainstep + step)
 
 
     avgLoss_diff=totalLoss_diff.cpu().detach().numpy()/step
@@ -212,6 +245,6 @@ for epoch in outtertqdm:
 
 with open(os.path.join(save_path, 'history_resunet.pkl'),'wb') as f:
     pickle.dump(history,f)
-writer.flush()
-writer.close()
+
+accelerator.end_training()
 
